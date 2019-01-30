@@ -1,0 +1,36 @@
+public GetKernelCallbackTableBase
+public FuncInt3
+public SetWindowFNID 
+_TEXT SEGMENT
+
+GetKernelCallbackTableBase PROC
+	;int 3
+	mov rax,gs:[60h]
+	lea rax,[rax+58h]
+	mov rax,[rax]
+	ret
+GetKernelCallbackTableBase ENDP
+
+FuncInt3 PROC
+	int 3
+	ret
+FuncInt3 ENDP
+
+SetWindowFNID PROC
+		mov r10,rcx;
+		mov r11,rdx;
+		mov eax,1095h;
+		syscall;
+		ret;
+SetWindowFNID ENDP
+
+SetLinkedUFIs PROC
+		mov r10,rcx;
+		mov eax,12EAh;
+		syscall;
+		ret;
+SetLinkedUFIs ENDP
+
+END
+
+
